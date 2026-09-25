@@ -1,0 +1,8 @@
+# The platform runs on the Python 3.10+ standard library alone.
+#
+# Optional: real LLM calls (INCIDENT_PLATFORM_USE_REAL_LLM=true and OPENAI_API_KEY set)
+# openai>=1.40
+#
+# Optional: statistical NER for PII (INCIDENT_PLATFORM_PII_NER=spacy), then run
+#   python -m spacy download en_core_web_sm
+# spacy>=3.7

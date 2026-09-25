@@ -1,0 +1,205 @@
+# Pod 2 -- IT Infrastructure Incident Remediation & Auto-Healing Platform
+ 
+**Enterprise Capstone -- AI for Technical Architects.** A working,
+runnable implementation of the Pod 2 scenario for CloudScale Global
+Networks: a hierarchical multi-agent pipeline that triages, plans, and
+executes remediation for P1/P2 infrastructure incidents, with mandatory
+human approval on anything destructive.
+ 
+**Runs with zero dependencies and zero API keys by default.** Real OpenAI
+calls are supported but off unless you explicitly opt in (see below).
+ 
+```bash
+cd incident_platform
+python3 main.py
+```
+ 
+That single command runs 7 scripted incidents exercising every required
+capability, then prints a metrics/audit summary. Read the console output
+top to bottom -- it *is* the demo.
+ 
+---
+ 
+## 1. What this is (and isn't)
+ 
+This is a **teaching-scale reference implementation**, built to
+demonstrate every architectural pattern the Capstone brief asks for, with
+functioning code behind each one -- not a production deployment. Every
+external system (Kubernetes, Prometheus/Datadog, the LLM provider) is
+mocked by default, with a clearly marked seam to swap in the real thing.
+See "Scope & limitations" (Section 8) for exactly what's mocked and why.
+ 
+## 2. Project flow (what happens when you run `main.py`)
+ 
+```
+Incident arrives (title, severity, raw telemetry)
+        |
+        v
+[TriageAgent]  --read-only MCP calls (fetch_k8s_logs, correlate_telemetry)-->
+        |  LLM reasoning (mock or real) -> root cause + confidence + category
+        v
+[RemediationPlannerAgent]  -->  drafts one MCP action + steps
+        |  output guardrail scans the drafted command
+        v
+   destructive action OR low confidence?
+        |                              \
+       no                              yes
+        |                               v
+        |                        [HITL Gate] -- incident PAUSES
+        |                        state -> AWAITING_APPROVAL
+        |                        approval payload generated
+        |                        SRE decides (approve/reject)
+        |                        state -> APPROVED/REJECTED, RESUME
+        |                               |
+        v                               v (if approved)
+[ExecutionVerificationAgent]  -->  MCP tool call (circuit-breaker + guardrail protected)
+        |
+        v
+   verify post-remediation health -> VERIFIED or FAILED
+```
+ 
+Every arrow in that diagram also: checks the semantic cache before
+spending a token, writes a span to the tracer, and writes an entry to the
+hash-chained audit log. See `docs/diagrams/agent_workflow_sequence.excalidraw`
+for the full visual sequence, and `docs/architecture_overview.md` for the
+Domain-Driven Design bounded-context breakdown.
+ 
+## 3. Enabling real OpenAI calls (disabled by default)
+ 
+```bash
+pip install -r requirements.txt
+export INCIDENT_PLATFORM_USE_REAL_LLM=true
+export OPENAI_API_KEY=sk-...
+python3 main.py
+```
+ 
+Both the env var **and** a present API key are required (see
+`llm/llm_backend.py:get_backend()`); missing either keeps you safely on
+the mock backend. If a real call fails at runtime (bad key, rate limit,
+network), `ResilientBackend` catches it and falls back to the mock rather
+than crashing the incident pipeline -- an LLM provider outage should never
+become an infrastructure-response outage.
+ 
+## 4. Running the interactive HITL flow
+ 
+`main.py` uses `AutoApprovalChannel` (scripted decisions) so the whole
+demo runs non-interactively and reproducibly. To approve/reject for real
+via your terminal:
+ 
+```python
+from hitl import ConsoleApprovalChannel
+orchestrator = IncidentOrchestrator(platform, ConsoleApprovalChannel())
+```
+ 
+This will pause execution, print the approval payload (the same payload a
+Slack/PagerDuty bot would render), and block on `input()` for your y/n.
+ 
+## 5. Repository layout
+ 
+```
+incident_platform/
+├── config.py                    # single source of runtime config; real-LLM flag defaults False
+├── main.py                      # scripted demo runner (7 incidents, all required scenarios)
+├── orchestrator.py               # IncidentOrchestrator (Coordinator) + IncidentPlatform (DI container)
+├── requirements.txt              # empty-by-default; openai only needed for real calls
+│
+├── agents/
+│   ├── base_agent.py             # think(): guardrail -> cache -> route -> profile -> audit
+│   ├── triage_agent.py           # RCA + confidence + category
+│   ├── remediation_planner_agent.py  # drafts one MCP action; output guardrail check
+│   └── execution_verification_agent.py  # HITL gate call -> tool execution -> health check
+│
+├── mcp_server/
+│   └── tool_server.py            # MCPToolServer: list_tools()/call_tool(), 6 tools, breaker+guardrail+audit wired in
+│
+├── hitl/
+│   └── hitl_gate.py               # ApprovalRequest, ConsoleApprovalChannel, AutoApprovalChannel
+│
+├── guardrails/
+│   └── guardrail_middleware.py    # input (prompt injection) + output (shell injection) + PII redaction
+│
+├── llm/
+│   ├── llm_backend.py             # MockLLMBackend (default), OpenAILLMBackend, ResilientBackend, get_backend()
+│   ├── model_router.py            # 2-tier routing (accuracy vs. cost)
+│   ├── semantic_cache.py          # L1 hash / L2 cosine-similarity cache
+│   └── token_profiler.py          # token estimation + cost tracking
+│
+├── observability/
+│   ├── tracer.py                  # OTel-shaped spans, no SDK dependency
+│   ├── audit_log.py               # hash-chained (tamper-evident) JSONL audit log
+│   └── metrics.py                 # latency/task, token rate, cache hit ratio, tool failure rate
+│
+├── state/
+│   ├── incident_state.py          # IncidentState enum, valid-transition graph, IncidentStateStore
+│   └── circuit_breaker.py         # CLOSED/OPEN/HALF_OPEN breaker per tool
+│
+├── finance/
+│   └── tco_roi_calculator.py      # runnable 3-year TCO/ROI model (`python3 finance/tco_roi_calculator.py`)
+│
+└── docs/
+    ├── architecture_overview.md   # DDD bounded contexts + textual component diagram
+    ├── financial_nfr_workbook.md  # generated output of the TCO/ROI calculator + NFR SLA matrix
+    ├── adr/
+    │   ├── ADR-01-topology-orchestration.md
+    │   ├── ADR-02-mcp-protocol-strategy.md
+    │   └── ADR-03-cost-performance-strategy.md
+    └── diagrams/
+        ├── generate_diagrams.py             # regenerates both .excalidraw files
+        ├── system_architecture.excalidraw    # top-level cloud/runtime/security architecture
+        └── agent_workflow_sequence.excalidraw # agent sequence + HITL approval boundary
+```
+ 
+## 6. How this maps to the evaluation rubric
+ 
+| Rubric parameter | Where to look |
+|---|---|
+| **Core Integration Path** (topology, MCP, circuit breaker) | `orchestrator.py` (hierarchical coordinator), `mcp_server/tool_server.py` (6 tools via `list_tools()`/`call_tool()`), `state/circuit_breaker.py`; rationale in ADR-01 and ADR-02 |
+| **Telemetry & Audit** | `observability/tracer.py` (OTel-shaped spans), `observability/audit_log.py` (hash-chained, `verify_chain()`), `observability/metrics.py` (the four required metrics, printed at the end of `main.py`) |
+| **Contract Compliance & Governance** | `hitl/hitl_gate.py` (destructive + confidence-threshold gates), `guardrails/guardrail_middleware.py` (injection defense, PII redaction), `docs/architecture_overview.md` (DDD Core/Supporting mapping) |
+| **Engineering Package Delivery** | This repository (functional code), `docs/diagrams/*.excalidraw`, `docs/adr/ADR-0{1,2,3}-*.md`, `docs/financial_nfr_workbook.md` / `finance/tco_roi_calculator.py` |
+ 
+## 7. Try these yourself
+ 
+- **Trip the circuit breaker differently:** change `fail_injection={"fetch_k8s_logs": 5}`
+  in `main.py` to a different tool/count.
+- **Change the HITL confidence threshold:** `config.SETTINGS.MIN_AUTONOMOUS_CONFIDENCE`
+  (currently 0.75 -- INC-1003's 0.62-confidence latency incident is
+  deliberately just under this, to demonstrate confidence-based escalation
+  distinct from destructiveness-based escalation).
+- **Verify the audit log wasn't tampered with:** `platform.audit.verify_chain()`
+  (try hand-editing a line in `audit_log.jsonl` and re-loading it -- the
+  chain breaks).
+- **Re-run the financial model with different assumptions:** edit the
+  `Assumptions` dataclass in `finance/tco_roi_calculator.py` and re-run it.
+ 
+## 8. Scope & limitations (read before a jury defense)
+ 
+Being upfront about what's real engineering vs. what's a placeholder:
+ 
+- **Real:** the state machine and its transition validation, the
+  circuit breaker, the hash-chained audit log, the guardrail pattern
+  matching, the semantic cache (genuinely computes cosine similarity over
+  hashed embeddings), the HITL pause/resume cycle, and the token/cost
+  accounting math.
+- **Mocked, with a clear seam to make real:** the MCP tool server's six
+  handlers return synthetic data instead of calling a real Kubernetes API,
+  Prometheus, or Terraform -- `mcp_server/tool_server.py`'s docstring
+  explains why the `list_tools()`/`call_tool()` shape means swapping the
+  transport doesn't require changing any calling code. The mock embedding
+  (`llm/semantic_cache.py`) is a hashing trick, not a trained model --
+  documented limitation, same pattern used successfully elsewhere in this
+  course.
+- **Not implemented (explicitly out of scope for this deliverable):**
+  a real out-of-process MCP server (this is in-process for demo
+  simplicity), persistence to an actual Redis/vector DB (in-memory stand-
+  ins with the same interface), and a real Slack/PagerDuty approval
+  channel (console/scripted channels provided instead).
+- **A bug worth knowing about (found and fixed during build):** an
+  earlier version of the semantic cache matched two *different* incident
+  types as duplicates (0.91 similarity) because it embedded the full
+  templated LLM prompt, and shared boilerplate labels drowned out the
+  actual symptom text. Fixed by caching on a distinct, content-focused
+  key rather than the full prompt (see the `cache_key` parameter in
+  `agents/base_agent.py` and the discussion in ADR-03). Worth knowing
+  because it's a realistic failure mode for anyone implementing semantic
+  caching for the first time, not just a demo artifact.
