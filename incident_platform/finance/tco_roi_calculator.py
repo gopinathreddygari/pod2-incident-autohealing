@@ -36,6 +36,7 @@ class Assumptions:
     build_cost_one_time: float = 180_000     # design, build, security review, rollout
     infra_cost_per_month: float = 3_500      # runtime, vector store, observability
     llm_cost_per_incident: float = 0.35      # conservative; main.py's short demo prompts cost ~$0.001 per incident
+    standby_llm_cost_per_month: float = 50   # fallback provider (Anthropic, ADR-05): monitoring + occasional use
     maintenance_fte: float = 0.5
     fte_annual_cost: float = 160_000
 
@@ -69,7 +70,8 @@ def model(a: Assumptions) -> list[YearResult]:
         downtime = minutes_saved * a.downtime_cost_per_min
         labour = minutes_saved / 60 * a.responders_per_incident * a.engineer_hourly_cost
         build = a.build_cost_one_time if year == 1 else 0.0
-        run = a.infra_cost_per_month * 12 + a.llm_cost_per_incident * incidents + a.maintenance_fte * a.fte_annual_cost
+        run = ((a.infra_cost_per_month + a.standby_llm_cost_per_month) * 12
+               + a.llm_cost_per_incident * incidents + a.maintenance_fte * a.fte_annual_cost)
         benefits = downtime + labour
         costs = build + run
         cumulative += benefits - costs
@@ -133,7 +135,9 @@ def render_tables(a: Assumptions) -> str:
 
 NFR_MATRIX = """| NFR | Target (SLA/SLO) | How it is met | Where it is evidenced |
 |---|---|---|---|
-| Availability of the remediation plane | 99.9% monthly | Stateless agents; LLM outage falls back to mock/rules (`ResilientBackend`); per-tool circuit breakers | `llm/llm_backend.py`, `state/circuit_breaker.py` |
+| Availability of the remediation plane | 99.9% monthly | Stateless agents; LLM fallback chain OpenAI -> Anthropic -> rules, each provider behind a circuit breaker (ADR-05); per-tool circuit breakers | `llm/llm_backend.py`, `llm/anthropic_backend.py`, `state/circuit_breaker.py` |
+| LLM failover time | < 1 s once a provider's breaker is open (≤ timeout + 1 retry before that) | Provider breaker: 3 failures -> skipped for 60 s | `tests/test_llm_fallback.py` |
+| Degraded-mode decision quality | Both providers down: known patterns still handled by rules; **unknown incidents escalate**, never guessed | Mock is the chain's last link; "no safe action" -> ESCALATED | ADR-05 |
 | Triage latency (p95, excluding human wait) | < 30 s real LLM; < 50 ms mock | Semantic cache before any model call; cost-tier routing for P2 | `metrics.py` latency-per-task, printed by `main.py` |
 | MTTR for automatable P1/P2 | < 25 min (baseline 95) | Autonomous path for high-confidence, non-destructive actions | `main.py` INC-1001 / INC-1004 |
 | Human approval SLA | Page within 1 min; decision within 15 min, else stays paused | HITL gate pauses in AWAITING_APPROVAL; unscripted/unanswered = reject | `hitl/hitl_gate.py` |

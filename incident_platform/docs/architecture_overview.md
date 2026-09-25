@@ -113,4 +113,4 @@ executed.
 | Audit log | Local JSONL | JSONL shipped to WORM object storage; head hash anchored externally |
 | Tracing | OTel-shaped spans in memory | OpenTelemetry SDK -> collector -> Tempo/Jaeger/Datadog |
 | Approval | Console / scripted / local web dashboard (`WebApprovalChannel`, blocks until a browser decision or the SLA timeout) | Slack or PagerDuty interactive message using the same `to_payload()` and the same blocking `ApprovalChannel` seam |
-| LLM | Mock by default | OpenAI (or other) via `ResilientBackend`, keys from a secrets manager |
+| LLM | Mock by default; opt-in OpenAI -> Anthropic -> mock chain | Same chain (ADR-05), keys from a secrets manager |

@@ -7,6 +7,10 @@ OPEN       after ``failure_threshold`` consecutive failures. Calls are
 HALF_OPEN  once ``recovery_timeout`` has elapsed. The next call is a trial:
            success closes the breaker, failure re-opens it.
 
+Recovery backoff: each failed trial doubles the OPEN period (30 s -> 60 s ->
+120 s ...), capped at ``max_recovery_timeout``, so a dependency that stays down
+is probed less and less often. A successful trial resets it to the base value.
+
 The clock is injectable so tests can move time without sleeping.
 """
 
@@ -40,10 +44,13 @@ class CircuitBreaker:
         recovery_timeout: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
         on_state_change: StateChangeHook | None = None,
+        max_recovery_timeout: float | None = None,  # None = no backoff (fixed OPEN period)
     ):
         self.name = name
         self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
+        self.base_recovery_timeout = recovery_timeout
+        self.max_recovery_timeout = max_recovery_timeout if max_recovery_timeout is not None else recovery_timeout
+        self.recovery_timeout = recovery_timeout  # current OPEN period
         self._clock = clock
         self._on_state_change = on_state_change
         self._state = BreakerState.CLOSED
@@ -79,6 +86,9 @@ class CircuitBreaker:
 
     def _record_failure(self) -> None:
         self._consecutive_failures += 1
+        if self._state is BreakerState.HALF_OPEN:
+            # The recovery trial failed: stay away twice as long next time.
+            self.recovery_timeout = min(self.recovery_timeout * 2, self.max_recovery_timeout)
         if (
             self._state is BreakerState.HALF_OPEN
             or self._consecutive_failures >= self.failure_threshold
@@ -89,6 +99,7 @@ class CircuitBreaker:
     def _record_success(self) -> None:
         self._consecutive_failures = 0
         self._opened_at = None
+        self.recovery_timeout = self.base_recovery_timeout
         if self._state is not BreakerState.CLOSED:
             self._set_state(BreakerState.CLOSED)
 
@@ -110,12 +121,14 @@ class BreakerRegistry:
         recovery_timeout: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
         on_state_change: StateChangeHook | None = None,
+        max_recovery_timeout: float | None = None,
     ):
         self._kwargs = dict(
             failure_threshold=failure_threshold,
             recovery_timeout=recovery_timeout,
             clock=clock,
             on_state_change=on_state_change,
+            max_recovery_timeout=max_recovery_timeout,
         )
         self._breakers: dict[str, CircuitBreaker] = {}
 

@@ -21,6 +21,7 @@
 | `build_cost_one_time` | 180,000 |
 | `infra_cost_per_month` | 3,500 |
 | `llm_cost_per_incident` | 0.35 |
+| `standby_llm_cost_per_month` | 50 |
 | `maintenance_fte` | 0.5 |
 | `fte_annual_cost` | 160,000 |
 | `years` | 3 |
@@ -29,18 +30,18 @@
 
 | Year | Incidents | Remediated | Minutes saved | Downtime savings | Labour savings | Benefits | Build cost | Run cost | Net | Cumulative net |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 480 | 216 | 15,120 | $378,000 | $53,550 | $431,550 | $180,000 | $122,168 | $129,382 | $129,382 |
-| 2 | 528 | 238 | 16,632 | $415,800 | $58,905 | $474,705 | $0 | $122,185 | $352,520 | $481,902 |
-| 3 | 581 | 261 | 18,295 | $457,380 | $64,796 | $522,176 | $0 | $122,203 | $399,972 | $881,874 |
+| 1 | 480 | 216 | 15,120 | $378,000 | $53,550 | $431,550 | $180,000 | $122,768 | $128,782 | $128,782 |
+| 2 | 528 | 238 | 16,632 | $415,800 | $58,905 | $474,705 | $0 | $122,785 | $351,920 | $480,702 |
+| 3 | 581 | 261 | 18,295 | $457,380 | $64,796 | $522,176 | $0 | $122,803 | $399,372 | $880,074 |
 
 ### 3-year summary
 
 | Metric | Value |
 |---|---|
-| Total cost of ownership | $546,556 |
+| Total cost of ownership | $548,356 |
 | Total benefits | $1,428,430 |
-| Net benefit | $881,874 |
-| ROI | 161% |
+| Net benefit | $880,074 |
+| ROI | 160% |
 | Payback | month 7 |
 
 **Reading the model.** Benefits come from two sources only: downtime minutes avoided on the
@@ -51,18 +52,20 @@ It deliberately ignores harder-to-defend benefits (fewer repeat incidents, on-ca
 
 | Scenario | 3-yr net | ROI | Payback |
 |---|---:|---:|---:|
-| Base case | $881,874 | 161% | month 7 |
-| Downtime cost halved | $256,284 | 47% | month 17 |
-| Automation coverage 0.45 -> 0.20 | $88,302 | 16% | month 27 |
-| Build cost +50% | $791,874 | 124% | month 11 |
-| Automated MTTR doubled (25 -> 50 min) | $371,721 | 68% | month 14 |
-| LLM cost x10 | $876,870 | 159% | month 8 |
+| Base case | $880,074 | 160% | month 7 |
+| Downtime cost halved | $254,484 | 46% | month 18 |
+| Automation coverage 0.45 -> 0.20 | $86,502 | 16% | month 27 |
+| Build cost +50% | $790,074 | 124% | month 11 |
+| Automated MTTR doubled (25 -> 50 min) | $369,921 | 67% | month 14 |
+| LLM cost x10 | $875,070 | 158% | month 8 |
 
 ## 2. Non-functional requirements & SLA matrix
 
 | NFR | Target (SLA/SLO) | How it is met | Where it is evidenced |
 |---|---|---|---|
-| Availability of the remediation plane | 99.9% monthly | Stateless agents; LLM outage falls back to mock/rules (`ResilientBackend`); per-tool circuit breakers | `llm/llm_backend.py`, `state/circuit_breaker.py` |
+| Availability of the remediation plane | 99.9% monthly | Stateless agents; LLM fallback chain OpenAI -> Anthropic -> rules, each provider behind a circuit breaker (ADR-05); per-tool circuit breakers | `llm/llm_backend.py`, `llm/anthropic_backend.py`, `state/circuit_breaker.py` |
+| LLM failover time | < 1 s once a provider's breaker is open (≤ timeout + 1 retry before that) | Provider breaker: 3 failures -> skipped for 60 s | `tests/test_llm_fallback.py` |
+| Degraded-mode decision quality | Both providers down: known patterns still handled by rules; **unknown incidents escalate**, never guessed | Mock is the chain's last link; "no safe action" -> ESCALATED | ADR-05 |
 | Triage latency (p95, excluding human wait) | < 30 s real LLM; < 50 ms mock | Semantic cache before any model call; cost-tier routing for P2 | `metrics.py` latency-per-task, printed by `main.py` |
 | MTTR for automatable P1/P2 | < 25 min (baseline 95) | Autonomous path for high-confidence, non-destructive actions | `main.py` INC-1001 / INC-1004 |
 | Human approval SLA | Page within 1 min; decision within 15 min, else stays paused | HITL gate pauses in AWAITING_APPROVAL; unscripted/unanswered = reject | `hitl/hitl_gate.py` |

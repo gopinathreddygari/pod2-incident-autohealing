@@ -1,4 +1,5 @@
 from .llm_backend import (
+    FallbackChainBackend,
     LLMOutputError,
     LLMResponse,
     MockLLMBackend,
@@ -13,6 +14,7 @@ from .token_profiler import TokenProfiler, estimate_tokens
 
 __all__ = [
     "CacheHit",
+    "FallbackChainBackend",
     "LLMOutputError",
     "LLMResponse",
     "MockLLMBackend",

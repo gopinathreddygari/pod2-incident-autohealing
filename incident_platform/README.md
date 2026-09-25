@@ -86,6 +86,28 @@ bounded-context breakdown.
 
 ## 3. Enabling real OpenAI calls (disabled by default)
 
+**Easiest: a `.env` file.** Copy `.env.example` to `.env` (same folder, git-ignored), then set:
+
+```ini
+INCIDENT_PLATFORM_USE_REAL_LLM=true     # the on/off switch: true = OpenAI, false = mock
+OPENAI_API_KEY=sk-...
+```
+
+**Fallback provider (optional): Anthropic Claude.** Also set `ANTHROPIC_API_KEY` (and
+`pip install anthropic` in the same environment as `openai`). Calls then go OpenAI -> Claude
+(`claude-opus-5` for the accuracy tier, `claude-haiku-4-5` for the cost tier) -> mock. Each provider
+has its own circuit breaker, and the dashboard labels a Claude answer `fallback → Claude`. Anthropic
+alone also works: it becomes the primary. See ADR-05.
+
+Flip the switch back to `false` to return to the mock. Or let the helper script do it and restart
+the dashboard: `.\restart-dashboard.cmd gpt` / `.\restart-dashboard.cmd mock` (only the switch line is
+changed; the key is never read out). Variables set in the terminal win over the
+file, and `INCIDENT_PLATFORM_LOAD_DOTENV=false` ignores the file completely. The first lines of every
+run show what was picked up, without ever printing the key:
+`config: loaded .env (2 settings); real LLM ON; OpenAI key set`. Tests never read `.env`.
+
+Or use environment variables directly:
+
 ```bash
 pip install -r requirements.txt          # after uncommenting the openai line
 export INCIDENT_PLATFORM_USE_REAL_LLM=true
@@ -276,7 +298,8 @@ incident_platform/
 │   └── pii_detector.py          # layered PII: regex rules + heuristic NER (+ optional spaCy NER)
 │
 ├── llm/
-│   ├── llm_backend.py           # MockLLMBackend (default), OpenAILLMBackend, ResilientBackend, get_backend()
+│   ├── llm_backend.py           # MockLLMBackend (default), OpenAILLMBackend, FallbackChainBackend, get_backend()
+│   ├── anthropic_backend.py     # AnthropicLLMBackend: the fallback provider (optional SDK)
 │   ├── model_router.py          # 2-tier routing (accuracy vs. cost)
 │   ├── semantic_cache.py        # L1 hash / L2 cosine-similarity cache
 │   └── token_profiler.py        # token estimation + cost tracking
@@ -302,7 +325,8 @@ incident_platform/
     │   ├── ADR-01-topology-orchestration.md
     │   ├── ADR-02-mcp-protocol-strategy.md
     │   ├── ADR-03-cost-performance-strategy.md
-    │   └── ADR-04-hitl-risk-classes.md
+    │   ├── ADR-04-hitl-risk-classes.md
+    │   └── ADR-05-llm-provider-resilience.md
     └── diagrams/
         ├── generate_diagrams.py             # regenerates both .excalidraw files
         ├── system_architecture.excalidraw    # top-level cloud/runtime/security architecture
@@ -324,7 +348,7 @@ python docs/diagrams/generate_diagrams.py              # regenerate the .excalid
 | **Core Integration Path** (topology, MCP, circuit breaker) | `orchestrator.py` (hierarchical coordinator), `mcp_server/tool_server.py` (9 tools with risk classes via `list_tools()`/`call_tool()`), `state/circuit_breaker.py`; rationale in ADR-01 and ADR-02 |
 | **Telemetry & Audit** | `observability/tracer.py` (OTel-shaped spans), `observability/audit_log.py` (hash-chained, `verify_chain()`), `observability/metrics.py` (the four required metrics, printed at the end of `main.py`) |
 | **Contract Compliance & Governance** | `hitl/hitl_gate.py` (risk-class + confidence-threshold gates), `guardrails/guardrail_middleware.py` (injection defense, PII redaction), `docs/architecture_overview.md` (DDD Core/Supporting mapping) |
-| **Engineering Package Delivery** | This repository (functional code + tests), `docs/diagrams/*.excalidraw`, `docs/adr/ADR-0{1,2,3,4}-*.md`, `docs/financial_nfr_workbook.md` / `finance/tco_roi_calculator.py` |
+| **Engineering Package Delivery** | This repository (functional code + tests), `docs/diagrams/*.excalidraw`, `docs/adr/ADR-0{1,2,3,4,5}-*.md`, `docs/financial_nfr_workbook.md` / `finance/tco_roi_calculator.py` |
 
 ## 7. Try these yourself
 

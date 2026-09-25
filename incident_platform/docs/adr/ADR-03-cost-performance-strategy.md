@@ -28,8 +28,33 @@ no AI at all.
   namespace and workload, because only the reasoning is cached, not the target.
 
 ### 3. Resilience
-- `ResilientBackend` falls back to the deterministic mock on any provider error.
+- LLM calls go through a provider fallback chain: OpenAI -> Anthropic -> the deterministic mock,
+  each provider behind a circuit breaker (ADR-05).
 - Per-tool circuit breakers stop retry storms against a failing dependency.
+
+### 3a. Retry policy: exponential backoff with jitter, inside the breaker
+Retries and circuit breakers solve different problems. Retries absorb **short blips**, and the
+breaker stops calls during **sustained outages**. They are combined as follows (`state/retry.py`,
+`TriageAgent._read_tool`):
+
+- **What is retried:** only **read-only** tools (safe to repeat), and only **transient** failures
+  (`execution_error`: timeouts and 5xx). Validation errors, guardrail blocks and circuit-open
+  rejections are returned immediately. **Remediations are never retried automatically**, because
+  running a rollback or a drain twice is not harmless.
+- **How long to wait:** exponential backoff with **full jitter**. Before retry *n* the wait is
+  `uniform(0, min(2.0 s, 0.2 s × 2^(n-1)))`. Jitter stops many callers from retrying in lock-step
+  against a recovering dependency.
+- **Retries sit inside the breaker:** every attempt counts towards its failure threshold, and once it
+  is OPEN the caller **stops waiting**, because the next call is rejected instantly.
+- **Time budget:** at most 5 s per logical call, waits included. During an incident a fast
+  "unavailable" beats a slow one.
+- **Breaker recovery backoff:** each failed HALF_OPEN trial doubles the OPEN period
+  (30 s -> 60 s -> 120 s, capped at 240 s), and a successful trial resets it.
+
+INC-1010 shows the whole sequence: two jittered waits, the breaker opens, no further waiting, the
+instant rejection, then escalation. Each wait is an audit entry and a `retry.backoff` span.
+Settings: `READ_TOOL_MAX_ATTEMPTS`, `RETRY_BASE_DELAY_S`, `RETRY_MAX_DELAY_S`, `RETRY_BUDGET_S`,
+`BREAKER_MAX_RECOVERY_TIMEOUT_S` in `config.py`.
 
 ### 4. Accounting (`llm/token_profiler.py`)
 - Every call records tokens and cost per model.

@@ -9,18 +9,25 @@ from llm.llm_backend import LLMOutputError
 
 from .base_agent import BaseAgent
 
-CATEGORIES = (
-    "pod_crashloop",
-    "resource_exhaustion",
-    "bad_deployment",
-    "node_disk_pressure",
-    "latency_degradation",
-    "stale_cache",
-    "known_defect",
-    "bad_config",
-    "region_outage",
-    "unknown",
-)
+# One-line definitions go into the prompt: a real model can't be expected to infer what a
+# bare label like "stale_cache" covers (e.g. it is *not* DNS resolution trouble).
+CATEGORY_DEFINITIONS: dict[str, str] = {
+    "pod_crashloop": "containers restart repeatedly (CrashLoopBackOff), e.g. wedged after a dependency or "
+                     "DNS blip, while freshly started pods would be healthy",
+    "resource_exhaustion": "containers are OOMKilled or throttled because load exceeds the current capacity or limits",
+    "bad_deployment": "errors or regressions that start right after a new release/rollout of the service's code",
+    "node_disk_pressure": "a single node reports DiskPressure or a full disk and is evicting pods",
+    "latency_degradation": "responses are slower (p95/p99 up) without crashes, errors or a recent deploy; "
+                           "typically a capacity shortfall",
+    "stale_cache": "the application serves outdated data from its own in-memory cache (entries past their TTL); "
+                   "not DNS resolution problems and not crash loops",
+    "known_defect": "a known software defect for which a vetted hotfix is available",
+    "bad_config": "a wrong configuration value (e.g. pool size, limit) shipped with a release, fixable by a "
+                  "vetted config patch",
+    "region_outage": "an entire region or cluster is unreachable while its standby is healthy",
+    "unknown": "none of the above fits, or the evidence is insufficient",
+}
+CATEGORIES = tuple(CATEGORY_DEFINITIONS)
 
 
 @dataclass
@@ -78,12 +85,38 @@ class TriageAgent(BaseAgent):
         return f"{incident.title} | {t.get('alert', '')} | {t.get('symptoms', '')}"
 
     def _read_tool(self, incident, tool: str, args: dict) -> dict:
-        """Read-only tools are safe to retry. Stop as soon as the breaker is open."""
+        """Call a read-only tool, retrying transient failures with exponential backoff + jitter.
+
+        * Only ``execution_error`` (timeouts / 5xx) is retried; validation, guardrail and
+          circuit-open results are returned immediately.
+        * If the tool's breaker is OPEN after a failure, don't wait: the next call is rejected
+          instantly, which ends the loop (and records the fast rejection).
+        * Stop when the next wait would overrun the policy's time budget.
+        """
+        p, policy, iid = self.p, self.p.retry_policy, incident.incident_id
+        started = p.clock()
         result: dict = {}
-        for _ in range(self.p.settings.READ_TOOL_MAX_ATTEMPTS):
-            result = self.p.tools.call_tool(tool, args, incident_id=incident.incident_id)
+        for attempt in range(1, policy.max_attempts + 1):
+            result = p.tools.call_tool(tool, args, incident_id=iid)
             if not result["isError"] or result["errorType"] != "execution_error":
                 break
+            if attempt == policy.max_attempts:
+                break
+            if p.breakers.get(tool).state.value == "OPEN":
+                continue  # no point waiting: the next call is rejected instantly
+            delay = policy.delay(attempt, p.rng)
+            if p.clock() - started + delay > policy.budget_s:
+                p.audit.record(self.name, "retry_budget_exhausted",
+                               {"incident_id": iid, "tool": tool, "attempts": attempt, "budget_s": policy.budget_s})
+                break
+            p.audit.record(self.name, "tool_retry", {
+                "incident_id": iid, "tool": tool, "next_attempt": attempt + 1, "max_attempts": policy.max_attempts,
+                "delay_s": round(delay, 3), "cap_s": round(policy.cap(attempt), 3),
+            })
+            with p.tracer.start_span("retry.backoff", {"incident.id": iid, "mcp.tool": tool,
+                                                       "retry.attempt": attempt + 1,
+                                                       "retry.delay_s": round(delay, 3)}):
+                p.sleep(delay)
         return result
 
     @staticmethod
@@ -94,7 +127,10 @@ class TriageAgent(BaseAgent):
             "Role: triage agent for production Kubernetes incidents.\n"
             "Determine the most likely root cause from the evidence below.\n"
             "Respond with JSON keys: root_cause (string), confidence (float 0-1), "
-            f"category (one of {', '.join(CATEGORIES)}).\n"
+            "category (exactly one of the names below).\n"
+            "CATEGORIES:\n"
+            + "".join(f"- {name}: {text}\n" for name, text in CATEGORY_DEFINITIONS.items())
+            + "Pick the category whose definition matches the evidence best. "
             "Lower your confidence when evidence is missing or circumstantial."
             f"{missing}\n"
             "EVIDENCE:\n"
