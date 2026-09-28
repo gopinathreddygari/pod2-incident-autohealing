@@ -12,6 +12,7 @@ through the coordinator, so the whole control flow is readable in ``handle()``.
 
 from __future__ import annotations
 
+import random
 import time
 
 from agents import ExecutionVerificationAgent, PlanningError, RemediationPlannerAgent, TriageAgent
@@ -21,7 +22,7 @@ from hitl import ApprovalChannel, HITLGate
 from llm import LLMOutputError, ModelRouter, SemanticCache, TokenProfiler, get_backend
 from mcp_server import MCPToolServer, MockCluster
 from observability import AuditLog, MetricsCollector, Tracer
-from state import VALID_TRANSITIONS, BreakerRegistry, Incident, IncidentState, IncidentStateStore
+from state import VALID_TRANSITIONS, BreakerRegistry, Incident, IncidentState, IncidentStateStore, RetryPolicy
 
 
 class IncidentPlatform:
@@ -32,8 +33,20 @@ class IncidentPlatform:
         backend=None,
         fail_injection: dict[str, int] | None = None,
         clock=time.monotonic,
+        sleep=time.sleep,
+        rng: random.Random | None = None,
     ):
         self.settings = settings or SETTINGS
+        # Injectable so tests can run retries/backoff instantly and deterministically.
+        self.clock = clock
+        self.sleep = sleep
+        self.rng = rng or random.Random()
+        self.retry_policy = RetryPolicy(
+            max_attempts=self.settings.READ_TOOL_MAX_ATTEMPTS,
+            base_delay_s=self.settings.RETRY_BASE_DELAY_S,
+            max_delay_s=self.settings.RETRY_MAX_DELAY_S,
+            budget_s=self.settings.RETRY_BUDGET_S,
+        )
         self.tracer = Tracer()
         self.audit = AuditLog(audit_path)
         self.metrics = MetricsCollector()
@@ -41,13 +54,14 @@ class IncidentPlatform:
         self.cache = SemanticCache(self.settings.CACHE_SIMILARITY_THRESHOLD, self.settings.CACHE_EMBEDDING_DIM)
         self.router = ModelRouter(self.settings.ACCURACY_TIER, self.settings.COST_TIER)
         self.profiler = TokenProfiler()
-        self.backend = backend or get_backend(self.settings)
+        self.backend = backend or get_backend(self.settings, on_breaker_change=self._on_breaker_change)
         self.store = IncidentStateStore(audit=self.audit, redact=self.guardrails.redact_text)
         self.breakers = BreakerRegistry(
             failure_threshold=self.settings.BREAKER_FAILURE_THRESHOLD,
             recovery_timeout=self.settings.BREAKER_RECOVERY_TIMEOUT_S,
             clock=clock,
             on_state_change=self._on_breaker_change,
+            max_recovery_timeout=self.settings.BREAKER_MAX_RECOVERY_TIMEOUT_S,
         )
         self.cluster = MockCluster()
         self.tools = MCPToolServer(
@@ -59,8 +73,10 @@ class IncidentPlatform:
         # Breakers don't know about incidents; the tool-call span they fire inside does.
         span = self.tracer.current_span()
         incident_id = span.attributes.get("incident.id") if span else None
-        self.audit.record("circuit_breaker", "state_change",
-                          {"incident_id": incident_id, "tool": name, "from": old.value, "to": new.value})
+        payload = {"incident_id": incident_id, "tool": name, "from": old.value, "to": new.value}
+        if new.value == "OPEN":
+            payload["open_for_s"] = self.breakers.get(name).recovery_timeout
+        self.audit.record("circuit_breaker", "state_change", payload)
 
 
 class IncidentOrchestrator:

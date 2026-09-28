@@ -74,6 +74,67 @@ class BackendSelectionTests(unittest.TestCase):
         self.assertEqual(backend.fallbacks, 1)
 
 
+class ModelOverrideTests(unittest.TestCase):
+    def test_model_names_can_be_overridden_from_env(self):
+        import os
+        from unittest import mock
+
+        import config
+        env = {"INCIDENT_PLATFORM_ACCURACY_MODEL": "my-big-model", "INCIDENT_PLATFORM_COST_MODEL": "my-small-model"}
+        with mock.patch.dict(os.environ, env):
+            s = config.load_settings()
+        self.assertEqual((s.ACCURACY_TIER.name, s.COST_TIER.name), ("my-big-model", "my-small-model"))
+        self.assertEqual(s.COST_TIER.input_cost_per_1k, Settings().COST_TIER.input_cost_per_1k)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(config.load_settings().ACCURACY_TIER.name, Settings().ACCURACY_TIER.name)
+
+
+class PromptGuidanceTests(unittest.TestCase):
+    def test_triage_prompt_defines_every_category_and_tools_say_when_to_use_them(self):
+        from agents.triage_agent import CATEGORY_DEFINITIONS, TriageAgent
+        from mcp_server import TOOL_SPECS
+        inc = Incident("INC-P", "t", "P1", {"symptoms": "s"})
+        prompt = TriageAgent._prompt(inc, {}, [])
+        for name, definition in CATEGORY_DEFINITIONS.items():
+            self.assertIn(f"- {name}: {definition}", prompt)
+        self.assertLess(prompt.index("CATEGORIES:"), prompt.index("EVIDENCE:"))  # mock reads evidence only
+        for spec in TOOL_SPECS:
+            if not spec.read_only:
+                self.assertIn("Use ", spec.description, spec.name)
+
+
+class DotenvTests(unittest.TestCase):
+    def test_parses_file_without_overriding_existing_variables(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        import config
+        content = ("\ufeff# comment line\n\n"
+                   "export DOTENV_T_A=plain\n"
+                   "DOTENV_T_B = \"quoted value\"\n"
+                   "DOTENV_T_C=keep # trailing comment\n"
+                   "DOTENV_T_D=from-file\n"
+                   "not a setting\n"
+                   "1BAD=ignored\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".env"
+            path.write_text(content, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"DOTENV_T_D": "from-shell"}):
+                loaded = config.load_dotenv(path)
+                values = {k: os.environ.get(k) for k in ("DOTENV_T_A", "DOTENV_T_B", "DOTENV_T_C", "DOTENV_T_D")}
+        self.assertEqual(sorted(loaded), ["DOTENV_T_A", "DOTENV_T_B", "DOTENV_T_C"])
+        self.assertEqual(values, {"DOTENV_T_A": "plain", "DOTENV_T_B": "quoted value",
+                                  "DOTENV_T_C": "keep", "DOTENV_T_D": "from-shell"})
+
+    def test_missing_file_is_fine_and_tests_never_load_dotenv(self):
+        import config
+        self.assertEqual(config.load_dotenv(config.ENV_FILE.with_name("does-not-exist.env")), [])
+        self.assertTrue(config.DOTENV_STATUS.startswith("disabled"))
+        self.assertFalse(config.SETTINGS.USE_REAL_LLM)
+
+
 class RouterTests(unittest.TestCase):
     def test_routing(self):
         s = Settings()

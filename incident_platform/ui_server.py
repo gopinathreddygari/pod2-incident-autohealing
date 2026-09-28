@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from config import SETTINGS
+from config import DOTENV_STATUS, SETTINGS
 from hitl import WebApprovalChannel
 from main import Scenario, build_scenarios, prepare_scenario
 from mcp_server import TOOL_SPECS
@@ -273,9 +273,17 @@ def _describe_step(entry: dict[str, Any]) -> tuple[str, str]:
         return f"→ {to}" + (f": {reason}" if reason else ""), level
     if action == "tool_call":
         mark = "  [destructive]" if p.get("destructive") else ""
+        if p.get("fault_cleared") is False:
+            return (f"MCP {p.get('tool')}({_args(p.get('arguments', {}))}) ✓ executed, "
+                    f"but it did not clear the fault{mark}"), "warn"
         return f"MCP {p.get('tool')}({_args(p.get('arguments', {}))}) ✓{mark}", "ok"
     if action == "tool_call_error":
         return f"MCP {p.get('tool')} failed: {p.get('error_type')} ({p.get('message')})", "error"
+    if action == "llm_call" and p.get("fallback_error"):
+        by = p.get("backend")
+        level = "warn" if by == "anthropic" else "error"   # a real second provider is a healthy fallback
+        return (f"LLM {p.get('model')}: earlier provider call FAILED ({p.get('fallback_error')}) -> answered by "
+                f"{'Anthropic' if by == 'anthropic' else 'the mock'} fallback instead"), level
     if action == "llm_call":
         pii = ", ".join(f"{k}×{n}" for k, n in (p.get("pii_sources") or {}).items())
         return (f"LLM {p.get('model')} ({p.get('backend')}): {p.get('tokens_in')} in / {p.get('tokens_out')} out tokens, "
@@ -293,7 +301,13 @@ def _describe_step(entry: dict[str, Any]) -> tuple[str, str]:
         return f"{verb} by {p.get('approver')} ({p.get('comment')})", "ok" if p.get("approved") else "error"
     if action == "state_change":
         to = p.get("to")
-        return f"Circuit breaker {p.get('tool')}: {p.get('from')} → {to}", "error" if to == "OPEN" else "warn"
+        held = f" for {p['open_for_s']:g} s" if to == "OPEN" and p.get("open_for_s") else ""
+        return f"Circuit breaker {p.get('tool')}: {p.get('from')} → {to}{held}", "error" if to == "OPEN" else "warn"
+    if action == "tool_retry":
+        return (f"Retrying {p.get('tool')} (attempt {p.get('next_attempt')}/{p.get('max_attempts')}) after "
+                f"{p.get('delay_s')} s backoff (jitter, cap {p.get('cap_s')} s)"), "warn"
+    if action == "retry_budget_exhausted":
+        return f"Stopped retrying {p.get('tool')}: {p.get('budget_s')} s retry budget used up", "error"
     if action == "illegal_transition_refused":
         return f"Refused illegal transition {p.get('from')} → {p.get('to')}", "error"
     return action or "", "info"
@@ -330,7 +344,37 @@ def _steps_by_incident(entries: list[dict[str, Any]]) -> dict[str, list[dict[str
     return out
 
 
-_SPAN_ATTRS = ("agent", "llm.model", "llm.tokens", "llm.backend", "cache.hit", "cache.similarity", "mcp.tool",
+def _llm_calls_by_incident(entries: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Per incident: who answered each LLM step -- 'openai', 'mock', 'fallback' (OpenAI failed) or 'cache'."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for e in entries:
+        p = e.get("payload", {})
+        iid = p.get("incident_id")
+        if not iid or e["action"] not in ("llm_call", "llm_cache_hit"):
+            continue
+        if e["action"] == "llm_cache_hit":
+            source = "cache"
+        elif p.get("fallback_error"):
+            source = "fallback"
+        else:
+            source = p.get("backend") if p.get("backend") in ("openai", "anthropic") else "mock"
+        out.setdefault(iid, []).append({
+            "agent": _ACTOR_LABELS.get(e["actor"], e["actor"]), "source": source, "model": p.get("model"),
+            "backend": p.get("backend"),
+            "layer": p.get("layer"), "error": p.get("fallback_error"),
+        })
+    return out
+
+
+def _llm_totals(entries: list[dict[str, Any]]) -> dict[str, int]:
+    totals = {"openai": 0, "anthropic": 0, "mock": 0, "fallback": 0, "cache": 0}
+    for calls in _llm_calls_by_incident(entries).values():
+        for c in calls:
+            totals[c["source"]] += 1
+    return totals
+
+
+_SPAN_ATTRS = ("retry.attempt", "retry.delay_s", "agent", "llm.model", "llm.tokens", "llm.backend", "cache.hit", "cache.similarity", "mcp.tool",
                "mcp.error_type", "hitl.reasons", "hitl.approved", "hitl.approver", "guardrail.blocked",
                "incident.final_state", "error.type")
 
@@ -507,12 +551,14 @@ class DemoApp:
         broken.entries = audit_entries
         first_broken = broken.first_broken_seq()
         steps = _steps_by_incident(audit_entries)
+        llm_calls = _llm_calls_by_incident(audit_entries)
         traces = _traces_by_incident(p.tracer)
         views = []
         for sc in list(session.scenarios):
             iid = sc.incident.incident_id
             view = _incident_view(sc, iid in session.started, p.guardrails.redact_text, p.guardrails.pii.find)
-            views.append({**view, "steps": steps.get(iid, []), "trace": traces.get(iid, [])})
+            views.append({**view, "steps": steps.get(iid, []), "trace": traces.get(iid, []),
+                          "llm": llm_calls.get(iid, [])})
         return {
             **base,
             "knobs": session.knobs,
@@ -523,6 +569,8 @@ class DemoApp:
             "next_up": session.next_up,
             "backlog": session.backlog_size,
             "pii_detector": p.guardrails.pii.name,
+            "real_llm": bool(p.settings.USE_REAL_LLM and (p.settings.OPENAI_API_KEY or p.settings.ANTHROPIC_API_KEY)),
+            "llm_totals": _llm_totals(audit_entries),
             "incidents": views,
             "pending": pending,
             "errors": list(session.errors),
@@ -644,6 +692,9 @@ def main() -> None:
     server = make_server(args.port)
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     print(f"Incident demo dashboard running at {url}  (Ctrl+C to stop)")
+    print(f"config: {DOTENV_STATUS}; real LLM {'ON' if SETTINGS.USE_REAL_LLM else 'off'}; "
+          f"OpenAI key {'set' if SETTINGS.OPENAI_API_KEY else 'not set'}; "
+          f"Anthropic key {'set' if SETTINGS.ANTHROPIC_API_KEY else 'not set'}")
     if not args.no_browser:
         threading.Timer(0.5, webbrowser.open, args=(url,)).start()
     try:

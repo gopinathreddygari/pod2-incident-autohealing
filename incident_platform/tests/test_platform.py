@@ -162,6 +162,71 @@ class ToolServerTests(unittest.TestCase):
         self.assertEqual(platform.breakers.snapshot()["fetch_k8s_logs"], "CLOSED")
 
 
+class RetryBackoffTests(unittest.TestCase):
+    """Read-only retries: exponential backoff + jitter, stop when the breaker opens, respect the budget."""
+
+    def _platform(self, **settings_overrides):
+        import random
+        now = [0.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        settings = replace(Settings(), **settings_overrides)
+        platform = IncidentPlatform(settings=settings, clock=lambda: now[0], sleep=sleep, rng=random.Random(1))
+        platform.cluster.register_fault("svc", "svc", ["log line"], ["signal"], {"restart_service"})
+        return platform, sleeps
+
+    def _read(self, platform, args=None):
+        from agents import TriageAgent
+        inc = Incident("INC-R1", "t", "P1", {"symptoms": "s"}, {"namespace": "n", "workload": "svc", "service": "svc"})
+        return TriageAgent(platform)._read_tool(inc, "fetch_k8s_logs", args or {"namespace": "n", "workload": "svc"})
+
+    def _retries(self, platform):
+        return [e["payload"] for e in platform.audit.filter(action="tool_retry")]
+
+    def test_transient_failures_are_retried_with_growing_jittered_waits(self):
+        platform, sleeps = self._platform()
+        platform.tools.inject_failures({"fetch_k8s_logs": 2})
+        self.assertFalse(self._read(platform)["isError"])        # third attempt succeeds
+        self.assertEqual(len(sleeps), 2)
+        self.assertLessEqual(sleeps[0], 0.2)                       # cap 0.2 s before retry 1
+        self.assertLessEqual(sleeps[1], 0.4)                       # cap doubles to 0.4 s
+        self.assertEqual([r["next_attempt"] for r in self._retries(platform)], [2, 3])
+        self.assertEqual(len([s for s in platform.tracer.spans if s.name == "retry.backoff"]), 2)
+
+    def test_no_wait_once_the_breaker_is_open(self):
+        platform, sleeps = self._platform()
+        platform.tools.inject_failures({"fetch_k8s_logs": 5})
+        result = self._read(platform)
+        self.assertEqual(result["errorType"], "circuit_open")      # 4th attempt rejected instantly
+        self.assertEqual(len(sleeps), 2)                           # waited before attempts 2 and 3 only
+        self.assertEqual(platform.metrics.tool_calls["fetch_k8s_logs"], {"ok": 0, "failed": 3, "rejected": 1})
+
+    def test_retry_budget_stops_retrying(self):
+        platform, sleeps = self._platform(RETRY_BASE_DELAY_S=1.0, RETRY_BUDGET_S=0.05)
+        platform.rng.uniform = lambda a, b: b                      # always wait the full cap
+        platform.tools.inject_failures({"fetch_k8s_logs": 5})
+        self.assertEqual(self._read(platform)["errorType"], "execution_error")
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(platform.audit.filter(action="retry_budget_exhausted")), 1)
+
+    def test_non_transient_errors_are_not_retried(self):
+        platform, sleeps = self._platform()
+        result = self._read(platform, {"namespace": "n; id", "workload": "svc"})
+        self.assertEqual(result["errorType"], "guardrail_blocked")
+        self.assertEqual((sleeps, self._retries(platform)), ([], []))
+
+    def test_breaker_open_period_is_recorded(self):
+        platform, _ = self._platform()
+        platform.tools.inject_failures({"fetch_k8s_logs": 5})
+        self._read(platform)
+        opened = [e["payload"] for e in platform.audit.filter(action="state_change") if e["payload"]["to"] == "OPEN"]
+        self.assertEqual(opened[0]["open_for_s"], Settings().BREAKER_RECOVERY_TIMEOUT_S)
+
+
 def _run_one(incident_id, decisions=None, settings=None, target_override=None):
     """Run one scripted scenario on a fresh platform; returns (platform, incident, channel)."""
     platform = IncidentPlatform(settings=settings or Settings())

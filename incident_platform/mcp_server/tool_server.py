@@ -94,7 +94,8 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "restart_service",
-        "Rolling restart of a service's pods (replicas are replaced one at a time).",
+        "Rolling restart of a service's pods (replicas are replaced one at a time). Use when pods are wedged "
+        "or crash-looping but a fresh start would be healthy (e.g. after a dependency or DNS blip).",
         _schema({"namespace": "string", "workload": "string"}),
         read_only=False,
         destructive=False,
@@ -104,7 +105,8 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "clear_pod_cache",
-        "Flush the in-memory caches of a workload's pods without restarting them.",
+        "Flush the in-memory caches of a workload's pods without restarting them. Use when the application "
+        "serves stale data from its own cache; not for DNS problems, crash loops or slowness.",
         _schema({"namespace": "string", "workload": "string"}),
         read_only=False,
         destructive=False,
@@ -114,7 +116,8 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "scale_deployment",
-        "Set the replica count of a deployment.",
+        "Set the replica count of a deployment. Use when load exceeds capacity: OOM kills under load, or "
+        "latency from a capacity shortfall.",
         _schema({"namespace": "string", "deployment": "string", "replicas": "integer"}),
         read_only=False,
         destructive=False,
@@ -124,7 +127,8 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "apply_hotfix",
-        "Apply a vetted strategic-merge patch (by patch id) to a deployment's spec.",
+        "Apply a vetted strategic-merge patch (by patch id) to a deployment's spec. Use when a known defect "
+        "or a bad configuration value has a vetted patch in the hotfix catalog.",
         _schema({"namespace": "string", "deployment": "string", "patch": "string"}),
         read_only=False,
         destructive=True,
@@ -137,7 +141,8 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "rollback_deployment",
-        "Roll a deployment back to its previous revision.",
+        "Roll a deployment back to its previous revision. Use when a regression started right after the "
+        "latest rollout of the service's code.",
         _schema({"namespace": "string", "deployment": "string"}),
         read_only=False,
         destructive=True,
@@ -147,7 +152,8 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "drain_node",
-        "Cordon a node and evict all of its pods.",
+        "Cordon a node and evict all of its pods. Use when a single node is unhealthy (e.g. DiskPressure) and "
+        "its workloads must move elsewhere.",
         _schema({"node": "string"}),
         read_only=False,
         destructive=True,
@@ -157,7 +163,8 @@ TOOL_SPECS: list[ToolSpec] = [
     ),
     ToolSpec(
         "failover_cluster",
-        "Shift a region's traffic to its standby cluster.",
+        "Shift a region's traffic to its standby cluster. Use only when an entire region is down and its "
+        "standby is healthy.",
         _schema({"region": "string"}),
         read_only=False,
         destructive=True,
@@ -324,7 +331,8 @@ class MCPToolServer:
                 "mcp_server",
                 "tool_call",
                 {"incident_id": incident_id, "tool": name, "arguments": arguments,
-                 "destructive": spec.destructive, "result_keys": sorted(data)},
+                 "destructive": spec.destructive, "result_keys": sorted(data),
+                 **({"fault_cleared": data["fault_cleared"]} if "fault_cleared" in data else {})},
             )
             return {
                 "content": [{"type": "text", "text": json.dumps(data)}],

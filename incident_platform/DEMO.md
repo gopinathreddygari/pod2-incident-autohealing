@@ -15,6 +15,11 @@ cd C:\Users\Administrator\Desktop\capstone_project_v2\incident_platform; $py = "
 
 ## A. Dashboard walkthrough (recommended for presenting)
 
+**Restart helper.** `.\restart-dashboard.cmd` (in `incident_platform`) stops any running dashboard and
+starts a fresh one with the right Python. Add `gpt` or `mock` to flip the `.env` switch first, e.g.
+`.\restart-dashboard.cmd gpt`. Options: `-Port 8001`, `-Pii heuristic`, `-NoBrowser`, and `-NoRestart`
+(flip the switch only).
+
 ```powershell
 & $py ui_server.py
 ```
@@ -62,7 +67,10 @@ panel reopens the card.
    `--patch-file=hotfixes/db-pool-size.yaml` command and the patch YAML itself. **Approve**, and it's VERIFIED.
 9. **INC-1009 pauses for a failover.** A region outage plans `failover_cluster`, and the card shows
    the Terraform draft. **Reject**: it ends REJECTED, and `failover_cluster` has 0 calls in the tools tile.
-10. **INC-1010.** The tools tile shows `fetch_k8s_logs` with 3 failures and the **OPEN** breaker
+10. **INC-1010.** In its **Steps** tab: a failure, "Retrying … after 0.1x s backoff", a second
+   failure and retry (longer cap), the third failure, "Circuit breaker … CLOSED → OPEN for 30 s", then
+   an instant `circuit_open` rejection with no more waiting. Its **Trace** tab shows the `retry.backoff`
+   spans. The tools tile shows `fetch_k8s_logs` with 3 failures and the **OPEN** breaker
    badge, and the incident is escalated for incomplete evidence. It runs last on purpose: the breaker
    stays OPEN for its 30 s recovery window.
 11. **Bottom panels.**
@@ -202,6 +210,13 @@ Expected: 3-year TCO **$546,556**, ROI **161%**, payback in **month 7**. The ful
 - To walk through the reasoning, use `docs/adr/ADR-01...03` and `docs/architecture_overview.md`.
 
 ## 9. Optional: real OpenAI calls
+
+**With the `.env` file (recommended):** open `incident_platform\.env` (`notepad .env`), set
+`INCIDENT_PLATFORM_USE_REAL_LLM=true` and `OPENAI_API_KEY=sk-...`, save, then run
+`.\.venv-ner\Scripts\python.exe main.py` (that venv has the `openai` package). Set the switch back to
+`false` to return to the mock. The run's second line confirms it: `config: loaded .env …; real LLM ON; OpenAI key set`.
+
+**Or with terminal variables:**
 
 This needs `pip install openai` and a key:
 

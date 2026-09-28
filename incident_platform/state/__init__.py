@@ -1,4 +1,5 @@
 from .circuit_breaker import BreakerRegistry, BreakerState, CircuitBreaker, CircuitOpenError
+from .retry import RetryPolicy
 from .incident_state import (
     TERMINAL_STATES,
     VALID_TRANSITIONS,
@@ -9,6 +10,7 @@ from .incident_state import (
 )
 
 __all__ = [
+    "RetryPolicy",
     "BreakerRegistry",
     "BreakerState",
     "CircuitBreaker",

@@ -24,7 +24,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 
-from config import SETTINGS
+from config import DOTENV_STATUS, SETTINGS
 from hitl import AutoApprovalChannel
 from orchestrator import IncidentOrchestrator, IncidentPlatform
 from state import Incident, IncidentState
@@ -227,6 +227,10 @@ def run_demo(audit_path: str | None = SETTINGS.AUDIT_LOG_PATH, verbose: bool = T
 
     _say(verbose, "=" * 78)
     _say(verbose, "CloudScale Global Networks -- Pod 2 Incident Remediation & Auto-Healing")
+    s = platform.settings
+    _say(verbose, f"config: {DOTENV_STATUS}; real LLM {'ON' if s.USE_REAL_LLM else 'off'}; "
+                  f"OpenAI key {'set' if s.OPENAI_API_KEY else 'not set'}; "
+                  f"Anthropic key {'set' if s.ANTHROPIC_API_KEY else 'not set'}")
     _say(verbose, f"LLM backend: {platform.backend.name}   "
                   f"autonomy threshold: {platform.settings.MIN_AUTONOMOUS_CONFIDENCE}   "
                   f"MCP tools: {', '.join(t['name'] for t in platform.tools.list_tools())}")
@@ -332,6 +336,13 @@ def _summary(platform: IncidentPlatform, results) -> None:
     print(f"     total cost ${prof.total_cost:.5f}; cache avoided ~{prof.tokens_saved_by_cache} tokens "
           f"(~${prof.cost_saved_by_cache:.5f})")
     print(f"     router decisions: {dict(platform.router.decisions)}")
+    answered: dict[str, int] = {}
+    for e in platform.audit.filter(action="llm_call"):
+        answered[e["payload"]["backend"]] = answered.get(e["payload"]["backend"], 0) + 1
+    print(f"     LLM calls answered by: {answered or 'none (all from cache or blocked)'}")
+    fallbacks = getattr(platform.backend, "fallbacks", 0)
+    if fallbacks:
+        print(f"     WARNING: {fallbacks} call(s) fell back to the mock -- last error: {platform.backend.last_error}")
 
     audit = platform.audit
     print("\nAudit & tracing")

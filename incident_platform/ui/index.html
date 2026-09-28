@@ -29,12 +29,21 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 button, input, select, textarea { font: inherit; color: inherit; }
-header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line); padding: 10px 20px; display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; }
-.brand { display: flex; flex-direction: column; margin-right: auto; }
+header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line); }
+.hwrap { max-width: 1500px; margin: 0 auto; padding: 12px 20px; display: flex; flex-direction: column; gap: 10px; }
+.hrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.brand { display: flex; flex-direction: column; min-width: 0; margin-right: auto; }
 .brand b { font-size: 16px; }
-.brand span { color: var(--muted); font-size: 12px; }
-.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
-.ctl { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 2px; }
+.brand span { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.pills { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.btngroup { display: flex; gap: 8px; flex-wrap: wrap; }
+.toolbar .spacer { flex: 1; }
+.btn.ghost { background: transparent; }
+.btn .sum { font-weight: 400; color: var(--muted); margin-left: 6px; font-size: 12px; }
+.settings { display: grid; grid-template-columns: repeat(4, minmax(0, max-content)); gap: 12px 28px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
+.settings[hidden] { display: none; }
+.ctl { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 4px; }
 .ctl .row { display: flex; gap: 6px; align-items: center; color: var(--ink); }
 .ctl input[type=range] { width: 120px; }
 .ctl select, .ctl input[type=number] { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
@@ -52,6 +61,12 @@ header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-
 .status.awaiting_approval { background: var(--amber-bg); color: var(--amber); animation: pulse 1.2s infinite; }
 .status.done { background: var(--green-bg); color: var(--green); }
 .status.waiting_next { background: var(--violet-bg); color: var(--violet); }
+.llmcount { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--grey-bg); color: var(--muted); }
+.llmcount.real { background: var(--green-bg); color: var(--green); }
+.llmcount.bad { background: var(--red-bg); color: var(--red); }
+.b-gpt { background: var(--green-bg); color: var(--green); }
+.b-mockllm { background: var(--grey-bg); color: var(--muted); }
+.b-fallback { background: var(--red-bg); color: var(--red); }
 .waitbadge { border: 1px solid var(--amber); background: var(--amber-bg); color: var(--amber); border-radius: 999px; padding: 4px 12px; font-size: 12px; font-weight: 700; cursor: pointer; animation: pulse 1.2s infinite; }
 .waitbadge:hover { animation: none; }
 .approvalbar { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber); border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; font-weight: 600; }
@@ -175,7 +190,10 @@ dialog .foot { grid-column: 1 / -1; display: flex; gap: 10px; justify-content: f
   .bottom { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .wide2 { grid-column: 1 / -1; }
   #incidents { max-height: none; }
-  header { padding: 10px 16px; }
+  header { position: static; }  /* a tall sticky header would cover a phone screen */
+  .hwrap { padding: 10px 16px; }
+  .settings { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .toolbar .spacer { display: none; }
 }
 @media (max-width: 560px) {
   .bottom { grid-template-columns: minmax(0, 1fr); }
@@ -193,30 +211,43 @@ dialog .foot { grid-column: 1 / -1; display: flex; gap: 10px; justify-content: f
 </head>
 <body>
 <header>
-  <div class="brand">
-    <b>CloudScale · Pod 2 Incident Auto-Healing</b>
-    <span id="sub">Live demo: same platform code as main.py; approvals happen here</span>
+ <div class="hwrap">
+  <div class="hrow">
+    <div class="brand">
+      <b>CloudScale · Pod 2 Incident Auto-Healing</b>
+      <span id="sub">Live demo: same platform code as main.py; approvals happen here</span>
+    </div>
+    <div class="pills">
+      <button class="waitbadge" id="waitbadge" hidden></button>
+      <span id="llmcount" class="llmcount" hidden></span>
+      <span id="status" class="status">idle</span>
+    </div>
   </div>
-  <div class="controls">
+  <div class="toolbar">
+    <div class="btngroup" role="group" aria-label="Demo run">
+      <button class="btn" id="run">↻ Start 10 scenarios</button>
+      <button class="btn primary" id="next" hidden>Next incident ▶</button>
+      <button class="btn" id="rest" hidden>Run the rest »</button>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn" id="custom">+ Custom incident</button>
+    <button class="btn ghost" id="settings-btn" aria-expanded="false" aria-controls="settings">⚙ Settings<span class="sum" id="settings-sum"></span></button>
+  </div>
+  <div class="settings" id="settings" hidden>
+    <div class="ctl">Pacing
+      <div class="row"><select id="k-mode"><option value="step">Step-through</option><option value="auto">Auto</option></select></div>
+    </div>
     <div class="ctl">Autonomy threshold
       <div class="row"><input id="k-conf" type="range" min="0.5" max="0.95" step="0.01"><span class="val" id="v-conf"></span></div>
-    </div>
-    <div class="ctl">INC-1010 fault injection
-      <div class="row"><select id="k-tool"></select><input id="k-count" type="number" min="0" max="10"></div>
     </div>
     <div class="ctl">Pace per step
       <div class="row"><input id="k-pace" type="range" min="0" max="2" step="0.1"><span class="val" id="v-pace"></span></div>
     </div>
-    <div class="ctl">Pacing
-      <div class="row"><select id="k-mode"><option value="step">Step-through</option><option value="auto">Auto</option></select></div>
+    <div class="ctl">INC-1010 fault injection
+      <div class="row"><select id="k-tool"></select><input id="k-count" type="number" min="0" max="10" aria-label="injected failures"></div>
     </div>
-    <span id="status" class="status">idle</span>
-    <button class="waitbadge" id="waitbadge" hidden></button>
-    <button class="btn" id="run">↻ Start 10 scenarios</button>
-    <button class="btn primary" id="next" hidden>Next incident ▶</button>
-    <button class="btn" id="rest" hidden>Run the rest ⏩</button>
-    <button class="btn" id="custom">+ Custom incident</button>
   </div>
+ </div>
 </header>
 
 <main>
@@ -308,12 +339,47 @@ function initKnobs(k, tools, fixes) {
   fill($("fix"), ["none", ...fixes].map((t) => h("option", { value: t }, t)));
   syncKnobLabels();
 }
-function syncKnobLabels() { $("v-conf").textContent = Number($("k-conf").value).toFixed(2); $("v-pace").textContent = Number($("k-pace").value).toFixed(1) + "s"; }
-["k-conf", "k-pace"].forEach((id) => $(id).addEventListener("input", syncKnobLabels));
+function syncKnobLabels() {
+  $("v-conf").textContent = Number($("k-conf").value).toFixed(2);
+  $("v-pace").textContent = Number($("k-pace").value).toFixed(1) + "s";
+  // The panel is usually closed, so the button always states the current settings.
+  $("settings-sum").textContent = `${$("k-mode").value === "step" ? "step-through" : "auto"} · threshold ${Number($("k-conf").value).toFixed(2)}`;
+}
+["k-conf", "k-pace", "k-mode"].forEach((id) => $(id).addEventListener("input", syncKnobLabels));
+function setSettingsOpen(open) {
+  $("settings").hidden = !open;
+  $("settings-btn").setAttribute("aria-expanded", String(open));
+  try { localStorage.setItem("settingsOpen", open ? "1" : "0"); } catch (e) { /* storage may be unavailable */ }
+}
+$("settings-btn").addEventListener("click", () => setSettingsOpen($("settings").hidden));
+try { if (localStorage.getItem("settingsOpen") === "1") setSettingsOpen(true); } catch (e) { /* default: closed */ }
 
 // ---------- render ----------
+function llmBadge(i) {
+  const src = new Set((i.llm || []).map((c) => c.source));
+  if (src.has("fallback")) {
+    const byClaude = (i.llm || []).some((c) => c.source === "fallback" && c.backend === "anthropic");
+    return h("span", { class: "badge " + (byClaude ? "b-hitl" : "b-fallback"),
+      title: byClaude ? "OpenAI failed; Claude answered instead" : "the real provider(s) failed; the mock answered instead" },
+      byClaude ? "fallback → Claude" : "fallback");
+  }
+  if (src.has("openai")) return h("span", { class: "badge b-gpt", title: "answered by a real OpenAI call" }, "GPT");
+  if (src.has("anthropic")) return h("span", { class: "badge b-gpt", title: "answered by a real Anthropic call" }, "Claude");
+  if (src.has("mock")) return h("span", { class: "badge b-mockllm", title: "answered by the deterministic mock" }, "mock LLM");
+  if (src.has("cache")) return h("span", { class: "badge b-cache", title: "answered from the semantic cache; no LLM call" }, "cache only");
+  return null;
+}
+function answeredBy(c) {
+  if (!c) return null;
+  if (c.source === "cache") return `semantic cache ${c.layer} (no LLM call)`;
+  if (c.source === "openai") return `${c.model} via OpenAI (real call)`;
+  if (c.source === "anthropic") return `${c.model} via Anthropic (real call)`;
+  if (c.source === "fallback") return c.backend === "anthropic"
+    ? `${c.model} via Anthropic (fallback: ${c.error})` : `mock fallback: real provider failed (${c.error})`;
+  return "mock LLM (no real call; real LLM is off)";
+}
 function badgesFor(i) {
-  const b = [];
+  const b = [llmBadge(i)].filter(Boolean);
   if (i.triage && i.triage.cache_layer) b.push(h("span", { class: "badge b-cache" }, "cache " + i.triage.cache_layer));
   if (i.plan && i.plan.cache_layer) b.push(h("span", { class: "badge b-cache" }, "plan cache " + i.plan.cache_layer));
   if (i.guardrail) b.push(h("span", { class: "badge b-guard" }, i.guardrail.stage + " guardrail"));
@@ -371,7 +437,8 @@ function renderDetail() {
     const t = i.triage, low = t.confidence < thr;
     secs.push(h("div", { class: "sec" }, h("h4", {}, "Triage"),
       kv([["Category", h("code", {}, t.category)],
-          ["Answered by", t.cache_layer ? `semantic cache ${t.cache_layer} (similarity ${Number(t.cache_similarity).toFixed(3)}), 0 tokens` : `model ${t.model}`],
+          ["Answered by", t.cache_layer ? `semantic cache ${t.cache_layer} (similarity ${Number(t.cache_similarity).toFixed(3)}), 0 tokens`
+            : (answeredBy((i.llm || []).find((c) => c.agent === "triage")) || `model ${t.model}`)],
           ["Confidence", `${t.confidence.toFixed(2)} ${low ? "<" : "≥"} threshold ${Number(thr).toFixed(2)}${low ? " (needs a human)" : ""}`]]),
       h("div", { class: "conf" }, h("div", { class: "fill" + (low ? " low" : ""), style: `width:${t.confidence * 100}%` }), h("div", { class: "thr", style: `left:${thr * 100}%` })),
       h("p", { style: "margin:6px 0 0" }, t.root_cause),
@@ -382,7 +449,8 @@ function renderDetail() {
     secs.push(h("div", { class: "sec" }, h("h4", {}, "Remediation plan"),
       kv([["Action", h("span", {}, h("code", {}, p.action), p.destructive ? h("span", { class: "badge b-destr", style: "margin-left:6px" }, "destructive") : null)],
           ["Risk class", h("span", { class: "badge " + (RISK_CLASS[p.risk_class] || "b-pii") }, p.risk_class + (GATED.has(p.risk_class) ? " · needs SRE approval" : " · autonomous"))],
-          ["Blast radius", p.blast_radius], p.cache_layer ? ["Answered by", "plan cache " + p.cache_layer] : null]),
+          ["Blast radius", p.blast_radius],
+          ["Answered by", answeredBy((i.llm || []).find((c) => c.agent === "planner")) || (p.cache_layer ? "plan cache " + p.cache_layer : "–")]]),
       h("div", { class: "small", style: "margin-top:6px" }, "Executed command (the only thing that runs):"),
       h("div", { class: "code" }, "$ " + p.command),
       p.script ? h("div", { class: "small", style: "margin-top:6px" }, `Recovery script draft (${p.script_format}), for review, not executed:`) : null,
@@ -534,8 +602,21 @@ function render() {
   nxt.disabled = S.status !== "waiting_next";
   nxt.textContent = S.next_up ? `Next: ${S.next_up} ▶` : "Next incident ▶";
   nxt.title = busy ? "Finish the current incident first" : "";
-  rest.textContent = `Run the rest (${S.backlog}) ⏩`;
-  $("sub").textContent = S.backend ? `LLM backend: ${S.backend} · PII: ${S.pii_detector} · threshold ${Number(S.knobs.min_confidence).toFixed(2)}` : "Live demo: same platform code as main.py; approvals happen here";
+  rest.textContent = `Run the rest (${S.backlog}) »`;
+  $("sub").textContent = S.backend
+    ? `LLM: ${S.backend === "mock" ? "mock" : S.backend.split("->")[0] + " (fallback: " + S.backend.split("->").slice(1).join(" → ") + ")"} · PII: ${S.pii_detector.replace(/\+/g, " + ")}`
+    : "Live demo: same platform code as main.py; approvals happen here";
+  const lc = $("llmcount"), tot = S.llm_totals;
+  lc.hidden = !tot;
+  if (tot) {
+    const calls = tot.openai + (tot.anthropic || 0) + tot.mock + tot.fallback;
+    lc.className = "llmcount" + (tot.fallback ? " bad" : tot.openai ? " real" : "");
+    lc.textContent = S.real_llm
+      ? `LLM calls: ${tot.openai} OpenAI` + (tot.anthropic ? ` · ${tot.anthropic} Claude` : "") + ` · ${tot.fallback} fallback`
+        + (tot.cache ? ` · ${tot.cache} cached` : "")
+      : `LLM: mock only (${calls} calls` + (tot.cache ? `, ${tot.cache} cached)` : ")");
+    lc.title = tot.fallback ? "Some OpenAI calls failed and the mock answered. Open the incident's Steps tab for the error." : "";
+  }
   const errs = $("errors");
   errs.hidden = !S.errors.length;
   errs.textContent = S.errors.join("\n");

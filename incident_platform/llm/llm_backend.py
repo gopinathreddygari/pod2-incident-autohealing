@@ -6,10 +6,12 @@ JSON object back. Which backend sits behind it is decided once by
 
 * The flag ``INCIDENT_PLATFORM_USE_REAL_LLM=true`` **and** ``OPENAI_API_KEY``
   are both required. If either is missing you stay on the mock.
-* The real backend is always wrapped in ``ResilientBackend``. A provider
-  failure (bad key, rate limit, network) falls back to the mock instead of
-  crashing the incident pipeline. An LLM outage must never become an
-  infrastructure-response outage.
+* Real providers are chained in ``FallbackChainBackend``: OpenAI -> Anthropic
+  (if ``ANTHROPIC_API_KEY`` is set) -> the deterministic mock. Any provider error
+  moves to the next link; each provider has its own circuit breaker, so a provider
+  that keeps failing is skipped instantly instead of costing a timeout per call.
+  The mock is the last link and never fails. An LLM outage must never become an
+  infrastructure-response outage. See ADR-05.
 """
 
 from __future__ import annotations
@@ -18,7 +20,9 @@ import json
 import re
 import sys
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
+
+from state.circuit_breaker import BreakerRegistry
 
 from .token_profiler import estimate_tokens
 
@@ -39,6 +43,10 @@ class LLMResponse:
     tokens_in: int
     tokens_out: int
     backend: str
+    # Set when an earlier provider in the chain failed and a later one answered.
+    fallback_error: str | None = None
+    # The model that actually answered (a fallback provider maps to its own model).
+    model: str | None = None
 
 
 class LLMBackend(Protocol):
@@ -244,32 +252,95 @@ class OpenAILLMBackend:
         return LLMResponse(text, tokens_in, tokens_out, self.name)
 
 
-class ResilientBackend:
-    """Try the primary backend; on any exception, answer from the fallback."""
+ModelMap = Callable[[str], str]
 
-    def __init__(self, primary: LLMBackend, fallback: LLMBackend):
-        self.primary = primary
-        self.fallback = fallback
-        self.name = f"{primary.name}->{fallback.name}"
+
+class FallbackChainBackend:
+    """Try each provider in order until one answers.
+
+    ``links`` is a list of ``(backend, model_map)``; ``model_map`` translates the routed
+    model name (e.g. the OpenAI accuracy tier) into that provider's equivalent, or is
+    None to pass it through. Every provider except the last has a circuit breaker
+    (when ``breakers`` is given), so a provider that keeps failing is skipped at once.
+    The last link must not fail (the platform always ends the chain with the mock).
+    """
+
+    def __init__(self, links: list[tuple[LLMBackend, ModelMap | None]], breakers: BreakerRegistry | None = None):
+        if len(links) < 2:
+            raise ValueError("a fallback chain needs at least two links")
+        self.links = links
+        self.breakers = breakers
+        self.name = "->".join(backend.name for backend, _ in links)
         self.fallbacks = 0
         self.last_error: str | None = None
 
     def complete(self, prompt: str, model: str) -> LLMResponse:
+        errors: list[str] = []
+        last = len(self.links) - 1
+        for index, (backend, model_map) in enumerate(self.links):
+            target = model_map(model) if model_map else model
+            breaker = self.breakers.get(f"llm:{backend.name}") if self.breakers and index < last else None
+            try:
+                response = breaker.call(backend.complete, prompt, target) if breaker else backend.complete(prompt, target)
+            except Exception as exc:  # provider errors must not break the pipeline
+                errors.append(f"{backend.name}: {type(exc).__name__}: {exc}")
+                if index < last:
+                    print(f"[llm] {backend.name} failed ({type(exc).__name__}: {exc}); "
+                          f"trying {self.links[index + 1][0].name}", file=sys.stderr)
+                    continue
+                raise
+            if response.model is None:
+                response.model = target
+            if errors:
+                self.fallbacks += 1
+                self.last_error = "; ".join(errors)
+                response.fallback_error = self.last_error[:300]
+            return response
+        raise RuntimeError("unreachable: the chain always returns or raises")
+
+
+class ResilientBackend(FallbackChainBackend):
+    """Two-link chain (primary, then fallback) without breakers; kept for callers and tests."""
+
+    def __init__(self, primary: LLMBackend, fallback: LLMBackend):
+        super().__init__([(primary, None), (fallback, None)])
+        self.primary = primary
+        self.fallback = fallback
+
+
+def _anthropic_model_map(settings) -> ModelMap:
+    """Route tier-for-tier: the OpenAI cost tier maps to the Anthropic cost tier, anything else to accuracy."""
+    def map_model(model: str) -> str:
+        if model == settings.COST_TIER.name:
+            return settings.ANTHROPIC_COST_TIER.name
+        return settings.ANTHROPIC_ACCURACY_TIER.name
+    return map_model
+
+
+def get_backend(settings, on_breaker_change=None) -> LLMBackend:
+    if not settings.USE_REAL_LLM:
+        return MockLLMBackend()
+    links: list[tuple[LLMBackend, ModelMap | None]] = []
+    if settings.OPENAI_API_KEY:
         try:
-            return self.primary.complete(prompt, model)
-        except Exception as exc:  # provider errors must not break the pipeline
-            self.fallbacks += 1
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            print(f"[llm] primary backend failed ({self.last_error}); using {self.fallback.name}", file=sys.stderr)
-            return self.fallback.complete(prompt, model)
-
-
-def get_backend(settings) -> LLMBackend:
-    if not (settings.USE_REAL_LLM and settings.OPENAI_API_KEY):
+            links.append((OpenAILLMBackend(settings.OPENAI_API_KEY, timeout=settings.LLM_TIMEOUT_S), None))
+        except ImportError:
+            print("[llm] OPENAI_API_KEY is set but the 'openai' package is not installed; skipping OpenAI",
+                  file=sys.stderr)
+    if getattr(settings, "ANTHROPIC_API_KEY", None):
+        try:
+            from .anthropic_backend import AnthropicLLMBackend
+            links.append((AnthropicLLMBackend(settings.ANTHROPIC_API_KEY, timeout=settings.LLM_TIMEOUT_S),
+                          _anthropic_model_map(settings)))
+        except ImportError:
+            print("[llm] ANTHROPIC_API_KEY is set but the 'anthropic' package is not installed; skipping Anthropic",
+                  file=sys.stderr)
+    if not links:
         return MockLLMBackend()
-    try:
-        primary = OpenAILLMBackend(settings.OPENAI_API_KEY, timeout=settings.LLM_TIMEOUT_S)
-    except ImportError:
-        print("[llm] real LLM requested but the 'openai' package is not installed; using mock", file=sys.stderr)
-        return MockLLMBackend()
-    return ResilientBackend(primary, MockLLMBackend())
+    links.append((MockLLMBackend(), None))
+    breakers = BreakerRegistry(
+        failure_threshold=settings.LLM_BREAKER_FAILURE_THRESHOLD,
+        recovery_timeout=settings.LLM_BREAKER_RECOVERY_TIMEOUT_S,
+        on_state_change=on_breaker_change,
+    )
+    return FallbackChainBackend(links, breakers)

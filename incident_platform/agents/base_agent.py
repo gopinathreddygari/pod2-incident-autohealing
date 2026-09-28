@@ -74,18 +74,32 @@ class BaseAgent:
 
             tier = p.router.route(incident.severity, complexity)
             response = p.backend.complete(prompt, tier.name)
-            usage = p.profiler.record(self.name, tier, response.tokens_in, response.tokens_out)
+            answered_by = _billing_tier(p.settings, response.model, tier)  # a fallback bills at its own prices
+            usage = p.profiler.record(self.name, answered_by, response.tokens_in, response.tokens_out)
             tokens = response.tokens_in + response.tokens_out
             p.metrics.record_tokens(tokens)
-            span.set_attribute("llm.model", tier.name)
+            span.set_attribute("llm.model", answered_by.name)
             span.set_attribute("llm.backend", response.backend)
+            if response.fallback_error:
+                span.set_attribute("llm.fallback_error", response.fallback_error)
             span.set_attribute("llm.tokens", tokens)
 
             data = parse_json_reply(response.text)
             p.cache.put(self.name, cache_key, data)
             p.audit.record(self.name, "llm_call", {
-                "incident_id": incident.incident_id, "model": tier.name, "backend": response.backend,
+                "incident_id": incident.incident_id, "model": answered_by.name, "backend": response.backend,
+                "routed_model": tier.name,
                 "tokens_in": response.tokens_in, "tokens_out": response.tokens_out,
                 "cost_usd": round(usage.cost_usd, 6), "pii_redactions": redactions, "pii_sources": pii_sources,
+                **({"fallback_error": response.fallback_error} if response.fallback_error else {}),
             })
-            return ThinkResult(data, None, None, tier.name, tokens)
+            return ThinkResult(data, None, None, answered_by.name, tokens)
+
+
+def _billing_tier(settings, model: str | None, routed):
+    """The priced tier for the model that actually answered (falls back to the routed tier)."""
+    for tier in (settings.ACCURACY_TIER, settings.COST_TIER,
+                 settings.ANTHROPIC_ACCURACY_TIER, settings.ANTHROPIC_COST_TIER):
+        if model == tier.name:
+            return tier
+    return routed

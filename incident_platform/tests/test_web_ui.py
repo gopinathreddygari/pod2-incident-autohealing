@@ -42,6 +42,80 @@ class WebApprovalChannelTests(unittest.TestCase):
         self.assertFalse(WebApprovalChannel().decide("apr-nope", True))
 
 
+class StepDescriptionTests(unittest.TestCase):
+    def test_retry_and_breaker_steps_are_described(self):
+        text, level = ui_server._describe_step({"action": "tool_retry", "payload": {
+            "tool": "fetch_k8s_logs", "next_attempt": 2, "max_attempts": 4, "delay_s": 0.151, "cap_s": 0.2}})
+        self.assertEqual(level, "warn")
+        self.assertIn("attempt 2/4) after 0.151 s backoff", text)
+        text, level = ui_server._describe_step({"action": "state_change", "payload": {
+            "tool": "fetch_k8s_logs", "from": "CLOSED", "to": "OPEN", "open_for_s": 30.0}})
+        self.assertEqual((text, level), ("Circuit breaker fetch_k8s_logs: CLOSED → OPEN for 30 s", "error"))
+
+    def test_tool_that_ran_but_did_not_fix_is_a_warning_not_an_error(self):
+        entry = {"action": "tool_call", "payload": {"tool": "clear_pod_cache", "arguments": {"workload": "x"},
+                                                    "fault_cleared": False}}
+        text, level = ui_server._describe_step(entry)
+        self.assertEqual(level, "warn")
+        self.assertIn("executed, but it did not clear the fault", text)
+        entry["payload"]["fault_cleared"] = True
+        self.assertEqual(ui_server._describe_step(entry)[1], "ok")
+
+
+class LLMSourceTests(unittest.TestCase):
+    """The dashboard must show whether each LLM answer was real OpenAI, the mock, a fallback or the cache."""
+
+    def _run(self, backend, incident_ids=("INC-1001", "INC-1004")):
+        import main
+        from config import Settings
+        from hitl import AutoApprovalChannel
+        from orchestrator import IncidentOrchestrator, IncidentPlatform
+        platform = IncidentPlatform(settings=Settings(), backend=backend)
+        orchestrator = IncidentOrchestrator(platform, AutoApprovalChannel())
+        for sc in main.build_scenarios():
+            if sc.incident.incident_id in incident_ids:
+                main.prepare_scenario(platform, sc)
+                orchestrator.handle(sc.incident)
+        return platform.audit.entries
+
+    def test_fallback_is_flagged_per_call_and_counted(self):
+        from llm import MockLLMBackend, ResilientBackend
+
+        class Down:
+            name = "openai"
+
+            def complete(self, prompt, model):
+                raise ConnectionError("provider down")
+
+        entries = self._run(ResilientBackend(Down(), MockLLMBackend()))
+        calls = ui_server._llm_calls_by_incident(entries)
+        self.assertEqual([c["source"] for c in calls["INC-1001"]], ["fallback", "fallback"])
+        self.assertIn("ConnectionError: provider down", calls["INC-1001"][0]["error"])
+        self.assertEqual([c["source"] for c in calls["INC-1004"]], ["cache", "cache"])
+        self.assertEqual(ui_server._llm_totals(entries),
+                         {"openai": 0, "anthropic": 0, "mock": 0, "fallback": 2, "cache": 2})
+        step = next(e for e in entries if e["action"] == "llm_call")
+        text, level = ui_server._describe_step(step)
+        self.assertEqual(level, "error")
+        self.assertIn("provider call FAILED", text)
+        self.assertIn("answered by the mock fallback", text)
+
+    def test_real_and_mock_answers_are_told_apart(self):
+        from llm import LLMResponse, MockLLMBackend
+
+        class FakeOpenAI(MockLLMBackend):  # answers like the mock, but reports itself as OpenAI
+            name = "openai"
+
+            def complete(self, prompt, model):
+                r = super().complete(prompt, model)
+                return LLMResponse(r.text, r.tokens_in, r.tokens_out, "openai")
+
+        real = ui_server._llm_calls_by_incident(self._run(FakeOpenAI(), ("INC-1001",)))
+        self.assertEqual({c["source"] for c in real["INC-1001"]}, {"openai"})
+        mock = ui_server._llm_calls_by_incident(self._run(MockLLMBackend(), ("INC-1001",)))
+        self.assertEqual({c["source"] for c in mock["INC-1001"]}, {"mock"})
+
+
 class DashboardServerTests(unittest.TestCase):
     def setUp(self):
         self.server = ui_server.make_server(port=0, default_pace=0)

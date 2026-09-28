@@ -110,6 +110,57 @@ class CircuitBreakerTests(unittest.TestCase):
         self.assertIs(self.breaker.state, BreakerState.OPEN)
 
 
+class RetryPolicyTests(unittest.TestCase):
+    def test_caps_double_and_are_bounded(self):
+        from state import RetryPolicy
+        policy = RetryPolicy(base_delay_s=0.2, max_delay_s=1.0)
+        self.assertEqual([policy.cap(n) for n in range(1, 6)], [0.2, 0.4, 0.8, 1.0, 1.0])
+
+    def test_full_jitter_stays_within_the_cap(self):
+        import random
+        from state import RetryPolicy
+        policy, rng = RetryPolicy(base_delay_s=0.2, max_delay_s=2.0), random.Random(42)
+        for n in range(1, 6):
+            delays = [policy.delay(n, rng) for _ in range(200)]
+            self.assertTrue(all(0.0 <= d <= policy.cap(n) for d in delays))
+            self.assertGreater(len({round(d, 6) for d in delays}), 150)  # actually jittered
+
+
+class BreakerRecoveryBackoffTests(unittest.TestCase):
+    def test_failed_trials_double_the_open_period_and_success_resets_it(self):
+        clock = FakeClock()
+        b = CircuitBreaker("t", failure_threshold=1, recovery_timeout=30, clock=clock, max_recovery_timeout=100)
+
+        def fail():
+            with self.assertRaises(RuntimeError):
+                b.call(_boom)
+
+        fail()                                   # CLOSED -> OPEN for 30 s
+        self.assertEqual(b.recovery_timeout, 30)
+        for expected in (60, 100, 100):          # each failed trial doubles, capped at 100
+            clock.t += b.recovery_timeout
+            self.assertIs(b.state, BreakerState.HALF_OPEN)
+            fail()
+            self.assertIs(b.state, BreakerState.OPEN)
+            self.assertEqual(b.recovery_timeout, expected)
+        clock.t += 99
+        self.assertIs(b.state, BreakerState.OPEN)  # not yet: the period is now 100 s
+        clock.t += 1
+        self.assertEqual(b.call(lambda: "ok"), "ok")
+        self.assertIs(b.state, BreakerState.CLOSED)
+        self.assertEqual(b.recovery_timeout, 30)   # reset after a successful trial
+
+    def test_without_a_max_the_period_stays_fixed(self):
+        clock = FakeClock()
+        b = CircuitBreaker("t", failure_threshold=1, recovery_timeout=30, clock=clock)
+        with self.assertRaises(RuntimeError):
+            b.call(_boom)
+        clock.t = 30
+        with self.assertRaises(RuntimeError):
+            b.call(_boom)
+        self.assertEqual(b.recovery_timeout, 30)
+
+
 class TracerTests(unittest.TestCase):
     def test_active_spans_are_visible_until_finished(self):
         from observability import Tracer
